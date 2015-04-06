@@ -1,0 +1,238 @@
+var api_token_ = false;
+var subdomain_ = false;
+var url_base_ = false;
+
+/**
+* Set the Highrise key.
+*
+* @param {string} Highrise API key;
+*/
+function setToken(k){
+  api_token_ = k;
+}
+
+/**
+* Set the Highrise key.
+*
+* @param {string} Highrise subdomain;
+*/
+function setSubdomain(sd){
+  subdomain_ = sd;
+  url_base_ = 'https://'+subdomain_+'.highrisehq.com/'
+}
+
+/**
+* Highrise People
+*
+* @param {object} .since: (optional) timestamp in yyyy-mm-dd-mm-ss format to fetch only people created/updated since, .tag_id: (optional) only people that match that tag
+* @return {array} people from Highrise
+*/
+function getPeople(opt) {
+  checkToken_();
+  var peeps = [];
+  var endpoint = 'people.xml?n=0';
+  if (opt.tag_id) endpoint+= '&tag_id='+opt.tag_id;
+  if (opt.since) endpoint+= '&since='+opt.since;
+  var peopleXML = callHighrise({endpoint:endpoint, uname:api_token_});
+  var peepsJson = XML_to_JSON_(peopleXML)
+  if (peepsJson.people && peepsJson.people.person) {
+    peeps = peepsJson.people.person;
+    if (!(peeps instanceof Array)) {
+      peeps = [peeps];
+    }
+  }
+  return peeps;
+
+}
+
+function getToken(uname, pw){
+  var userXML = callHighrise({endpoint:'me.xml', uname:uname, pw:pw});
+  var user = XML_to_JSON_(userXML).user;
+  var token = user.token.Text;
+  setToken(token);
+  return token;
+}
+
+function getPhoneNumbers(opt) {
+  var peeps = getPeople(opt);
+  var cleaned = [];
+  if (peeps.length) {
+    peeps.forEach(function(p){
+      var clean = {
+        id : p.id.Text,
+        phones : extractPhones_(p)
+      }
+      if (clean.phones.length) cleaned.push(clean);
+    });
+  }
+  return cleaned;
+}
+
+function getCustomFields() {
+  checkToken_();
+  var fieldsXML = callHighrise({endpoint:'subject_fields.xml', uname:api_token_});
+  var fields = XML_to_JSON_(fieldsXML)['subject-fields']['subject-field'];
+  return fields;
+}
+
+function createCustomField(label) {
+  var payload = '<subject-field><label>' + label + '</label></subject-field>';
+  var fieldXML = callHighrise({endpoint:'subject_fields.xml', uname:api_token_, method:'post', payload:payload});
+  var field = XML_to_JSON_(fieldXML);
+  return field;
+}
+
+function updateCustomFieldOnPerson(opt) {
+  var personXML = callHighrise({endpoint:'people/'+opt.person_id+'.xml', uname:api_token_});
+  var person = XML_to_JSON_(personXML).person;
+  var existingFieldVal = extractCustomField_(person, opt.field_id);
+  if (existingFieldVal !== '') opt.field_value += '<br><br>' + existingFieldVal;
+  var payload = '<person><subject_datas type="array"><subject_data><subject_field_id type="integer">' + opt.field_id + '</subject_field_id><value><![CDATA[' + opt.field_value + ']]></value></subject_data></subject_datas></person>';
+  var updateXML = callHighrise({endpoint:'people/'+opt.person_id+'.xml', uname:api_token_, method:'put', payload:payload});
+  return updateXML;
+}
+
+///// HELPERS
+
+function extractPhones_(p) {
+  var cleaned = [];
+  var phones = p['contact-data']['phone-numbers']['phone-number'];
+  if (!(phones instanceof Array)) {
+    phones = [phones];
+  }
+  phones.forEach(function(pn){
+    var num = pn['number'];
+    if (typeof num !== "undefined") {
+      var clean = pn['number']['Text'].replace(/\D/g, '');
+      if (clean.charAt(0) !== '1') clean = '1'+clean;
+      cleaned.push(clean);
+    }
+  });
+  return cleaned;
+}
+
+function extractCustomField_(p, field_id) {
+  field_id = '' + field_id; //make sure it's a string
+  var existingText = '';
+  if (p['subject_datas'] && p['subject_datas']['subject_data']) {
+    var fields = p['subject_datas']['subject_data'];
+    if (!(fields instanceof Array)) {
+      fields = [fields];
+    }
+    fields.forEach(function(f){
+      if (f.subject_field_id.Text == field_id) {
+        existingText = f.value.Text;
+      }
+    });
+  }
+
+  return existingText;
+}
+
+function findTagId(tag) {
+  checkToken_();
+  var tag_id = false;
+  var tagsXML = callHighrise({endpoint:'tags.xml', uname:api_token_});
+  var tagsJson = XML_to_JSON_(tagsXML);
+  if (tagsJson['tags'] && tagsJson['tags']['tag']) {
+    var tags = tagsJson['tags']['tag'];
+    if (!(tags instanceof Array)) {
+      tags = [tags];
+    }
+    tags.forEach(function(t){
+      if (t.name.Text == tag) {
+        tag_id = t.id.Text;
+      }
+    });
+  }
+
+  return tag_id;
+}
+
+function checkToken_(){
+  if (!api_token_) {
+    throw "No Highrise API token";
+  } else {
+    return true;
+  }
+}
+
+function checkSubdomain_(){
+  if (!subdomain_) {
+    throw "No Highrise subdomain";
+  } else {
+    return true;
+  }
+}
+
+/**
+* @param {obj} .endpoint, .uname, .pw, .method: method the HTTP method (get or post), .payload: the XML payload to send
+*
+* @return the HTTP Response
+*/
+function callHighrise(opt) {
+  Logger.log(opt)
+  opt.pw = opt.pw || 'fake';
+  opt.method = opt.method || 'get'
+  var headers = {
+    'Authorization': 'Basic ' + Utilities.base64Encode(opt.uname + ':' + opt.pw, Utilities.Charset.UTF_8),
+    'User-Agent': 'Nexmo Insight App Contest (http://nexmo-crm.challengepost.com/)'
+  }
+  if (opt.method == 'post' || opt.method == 'put') headers['Content-type'] = 'application/xml';
+
+  var options = {
+    headers: headers,
+    method: opt.method
+  }
+
+  if (opt.payload) options.payload = opt.payload;
+  var resp = UrlFetchApp.fetch(url_base_+opt.endpoint, options);
+  return resp;
+}
+
+// http://ctrlq.org/code/19952-convert-xml-to-json
+/**
+ * Converts an XML string to a JSON object, using logic similar to the
+ * sunset method Xml.parse().
+ * @param {string} xml The XML to parse.
+ * @returns {Object} The parsed XML.
+ */
+function XML_to_JSON_(xml) {
+  var doc = XmlService.parse(xml);
+  var result = {};
+  var root = doc.getRootElement();
+  result[root.getName()] = elementToJSON_(root);
+  return result;
+}
+
+/**
+ * Converts an XmlService element to a JSON object, using logic similar to
+ * the sunset method Xml.parse().
+ * @param {XmlService.Element} element The element to parse.
+ * @returns {Object} The parsed element.
+ */
+function elementToJSON_(element) {
+  var result = {};
+  // Attributes.
+  element.getAttributes().forEach(function(attribute) {
+    result[attribute.getName()] = attribute.getValue();
+  });
+  // Child elements.
+  element.getChildren().forEach(function(child) {
+    var key = child.getName();
+    var value = elementToJSON_(child);
+    if (result[key]) {
+      if (!(result[key] instanceof Array)) {
+        result[key] = [result[key]];
+      }
+      result[key].push(value);
+    } else {
+      result[key] = value;
+    }
+  });
+  // Text content.
+  if (element.getText()) {
+    result['Text'] = element.getText();
+  }
+  return result;
+}

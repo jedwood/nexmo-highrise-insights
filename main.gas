@@ -1,0 +1,468 @@
+
+// you can set up a timed trigger to run this as often as appropriate. In the menu, select "Resources > Current project's triggers..."
+
+function syncWithHighrise() {
+
+  var config = getConfig();
+
+  authHighrise(config);
+  authNexmo(config);
+
+  var cb = getApiEndpoint();
+
+  var nexmoFieldId = config.highrise_nexmo_field_id;
+  if (nexmoFieldId == null) {
+    nexmoFieldId = getNexmoField();
+    config.highrise_nexmo_field_id = nexmoFieldId;
+    saveConfig(config);
+  }
+
+  var highriseOpts = {};
+  if (config.last_sync !== null) highriseOpts.since = config.last_sync;
+  if (config.highrise_tag) {
+    var leTagId = Highrise.findTagId(config.highrise_tag);
+    if (leTagId) highriseOpts.tag_id = leTagId;
+  }
+
+  var peeps = Highrise.getPhoneNumbers(highriseOpts);
+  peeps.forEach(function(p){
+    var needDelay = (p.phones.length > 1); //lame hack to keep multiple phones from writing over top of each other in the Highrise API
+    p.phones.forEach(function(ph){
+      var nexmoReq = Nexmo.getInsight({number:ph, client_ref:p.id}, cb);
+      if (needDelay) Utilities.sleep(1000);
+    });
+  });
+
+  config.last_sync = new Date().toISOString();
+  saveConfig(config);
+}
+
+// This is the Google-reserved function name that allows HTTP GET requests from the outside world
+function doGet(req) {
+  var configSheet = SpreadsheetApp.openById(getId()).getSheetByName('config');
+  var config = getRowByIndex(configSheet, 2);
+  var sheet = getSheet(req); //defaults to the first sheet
+  authHighrise(config);
+  var nexmoFieldId = config.highrise_nexmo_field_id;
+  if (nexmoFieldId == null) {
+    nexmoFieldId = getNexmoField();
+    config.highrise_nexmo_field_id = nexmoFieldId;
+    saveConfig(config);
+  }
+
+  saveToSpreadsheet(sheet, req.parameter);
+  if (req.parameter.status !== "2") {
+    var updateResult = Highrise.updateCustomFieldOnPerson({person_id:req.parameter.client_ref, field_id:nexmoFieldId, field_value:formatNexmoData(req.parameter)});
+  }
+  var returnData = {success: true};
+  return sendResponse(req, returnData);
+}
+
+// HELPERS specific to this application
+
+function authHighrise(config) {
+  if (config.highrise_subdomain == null) {
+    throw "Must specify highrise subdomain";
+  }
+  Highrise.setSubdomain(config.highrise_subdomain);
+  if (config.highrise_api_token == null) {
+    if (config.highrise_username == null || config.highrise_password == null) {
+      throw "Must specify either highrise_api_token or both username and password";
+    }
+    var leToken = Highrise.getToken(config.highrise_username, config.highrise_password);
+    config.highrise_api_token = leToken;
+    delete config.highrise_username;
+    delete config.highrise_password;
+  }
+  Highrise.setToken(config.highrise_api_token);
+}
+
+function authNexmo(config) {
+  if (config.nexmo_api_key == null || config.nexmo_api_secret == null) {
+    throw "Must specify Nexmo api_key and api_secret";
+  }
+  Nexmo.setCreds(config.nexmo_api_key, config.nexmo_api_secret);
+}
+
+function getNexmoField() {
+  var nexmoFieldId = false;
+  var customFields = Highrise.getCustomFields();
+  for (var i=0; i<customFields.length; i++) {
+    if (customFields[i].label.Text == 'Nexmo Insight') {
+      nexmoFieldId = customFields[i].id.Text;
+      break;
+    }
+  }
+  if (nexmoFieldId == false) {
+    var createNextmoField = Highrise.createCustomField('Nexmo Insight');
+    nexmoFieldId = createNextmoField['subject-field'].id.Text;
+  }
+  return nexmoFieldId;
+}
+
+function formatNexmoData(d) {
+  var retString = '';
+  retString += d.number;
+  var validStatus = 'unknown';
+  if (d.valid == 'valid') validStatus = 'yes';
+  if (d.valid == 'not_valid') validStatus = 'no';
+  retString += '<br>Valid: ' + validStatus;
+  retString += '<br>Reachable: ' + d.reachable;
+  if (d.number_type) retString += '<br>Type: ' + d.number_type;
+  if (d.carrier_network_name) retString += '<br>Carrier: ' + d.carrier_network_name;
+  if (d.roaming && d.roaming == 'roaming') retString += '<br>Roaming: ' + d.roaming_country_code;
+  return retString;
+}
+
+function getConfig() {
+  var configSheet = SpreadsheetApp.openById(getId()).getSheetByName('config');
+  return getRowByIndex(configSheet, 2);
+}
+
+function saveConfig(config) {
+  var configSheet = SpreadsheetApp.openById(getId()).getSheetByName('config');
+  var rowified = objectToRow(configSheet, config);
+  var leRange = configSheet.getRange(2, 1, 1, rowified.length);
+  leRange.setValues([rowified]);
+}
+
+/////////////////////// HELPERS that are generic. Let's make working with a Google Spreadsheet a little less painful
+
+function getApiEndpoint() {
+  var scriptProperties = PropertiesService.getScriptProperties();
+  scriptProperties.setProperty('ssid', SpreadsheetApp.getActiveSpreadsheet().getId());
+  var ep = ScriptApp.getService().getUrl();
+  return ep;
+}
+
+/**
+* send back the response
+*
+* @param {req} the HTTP request object
+* @param {returnData} the object to send
+*
+*/
+function sendResponse(req, returnData) {
+   return ContentService.createTextOutput(JSON.stringify(returnData)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+* @param {req} the HTTP request object
+*
+*/
+function getSheet(req) {
+  var sheet;
+  if (req.parameter.sheet) {
+    sheet = SpreadsheetApp.openById(getId()).getSheetByName(req.parameter.sheet);
+  } else {
+    sheet = SpreadsheetApp.openById(getId()).getSheets()[0];
+  }
+  return sheet;
+}
+
+/**
+* Iterates row by row in the input range and returns an array of objects. Each object contains all the data for a given row, indexed by its normalized column name.
+*
+* @param {sheet} the sheet object that contains the data to be processed
+* @param {nestedProps} use dot notation as nested properties
+* @param {integer} (optional): 1-based (NOT zero-based) specifies the row number where the column names are stored, defaults to first row.
+* @return {array} array of objects
+*/
+function getRowsData(sheet, nestedProps, columnHeadersRowIndex) {
+  columnHeadersRowIndex = columnHeadersRowIndex || 1;
+  nestedProps = (nestedProps === false) ? false : true;
+  var range = sheet.getDataRange();
+  var numColumns = range.getLastColumn() - range.getColumn() + 1;
+  var headersRange = sheet.getRange(columnHeadersRowIndex, range.getColumn(), 1, numColumns);
+  var headers = headersRange.getValues()[0];
+  var dataRange = range.getValues();
+  dataRange.splice(0, columnHeadersRowIndex);
+  return getObjects(dataRange, normalizeHeaders(headers), nestedProps);
+}
+
+/**
+* Gets a single row based on index.
+*
+* @param {sheet} the sheet object that contains the data to be processed
+* @param {object} one or more key:val pairs to match on
+* @return {object} matched row as an object
+*/
+function getRowByIndex(sheet, ind, nestedProps, columnHeadersRowIndex) {
+  columnHeadersRowIndex = columnHeadersRowIndex || 1;
+  nestedProps = (nestedProps === false) ? false : true;
+  var range = sheet.getDataRange();
+  var numColumns = range.getLastColumn() - range.getColumn() + 1;
+  var headersRange = sheet.getRange(columnHeadersRowIndex, range.getColumn(), 1, numColumns);
+  var headers = headersRange.getValues()[0];
+  //Now we have the info we need to get the range for just a single row and make an object
+  var singleRowRange = sheet.getRange(ind,range.getColumn(),1,range.getLastColumn());
+  var dataRange = singleRowRange.getValues();
+  return getObjects(dataRange, normalizeHeaders(headers), nestedProps)[0];
+}
+
+/**
+* Finds a single row based on matching field(s).
+*
+* @param {sheet} the sheet object that contains the data to be processed
+* @param {object} one or more key:val pairs to match on
+* @return {object} matched row as an object
+*/
+function findRow(sheet, matchingObj) {
+  var allRows = getRowsData(sheet, false);
+  var numRows = allRows.length;
+  for (var i=0; i<numRows; i++) {
+    var leRow = allRows[i];
+    var isMatch = true;
+    for (var prop in matchingObj) {
+      if (leRow[prop] != matchingObj[prop]) {
+        isMatch = false;
+        break;
+      };
+    }
+    if (isMatch) {
+      // plus 1 because rows are 1-based, another plus one because getRowsData assumes a header row
+      return {index: i+2, data: leRow};
+    }
+  }
+  return false;
+}
+
+/**
+* Takes an object and saves it to spreadsheet matching up column headers with object properties
+* @param {sheet}
+* @param {object}
+*/
+function objectToRow(sheet,record) {
+  var headersRange = sheet.getRange(1, 1, 1, sheet.getMaxColumns());
+  var headers = normalizeHeaders(headersRange.getValues()[0]);
+  var values = [];
+  for (j = 0; j < headers.length; ++j) {
+    var header = headers[j];
+    var objVal;
+    var headerBits = header.split('.');
+    var evalable = "record";
+
+    for (var h=0; h<headerBits.length; h++) {
+      evalable+= '["' + headerBits[h] + '"]';
+      objVal = eval(evalable);
+      if (typeof objVal === "undefined") {
+        break;
+      }
+    }
+
+    // If the header is empty or the object value is empty...
+    if ( (!header.length > 0) || typeof objVal === 'undefined' || objVal == '' ) {
+      values.push('');
+    }
+    else {
+      values.push(objVal);
+    }
+  }
+  return values;
+}
+
+/**
+* Takes an object and saves it to spreadsheet matching up column headers with object properties
+* @param {sheet}
+* @param {object}
+*/
+function saveToSpreadsheet(sheet,record) {
+  var headersRange = sheet.getRange(1, 1, 1, sheet.getMaxColumns());
+  var headers = normalizeHeaders(headersRange.getValues()[0]);
+  var values = [];
+  for (j = 0; j < headers.length; ++j) {
+    var header = headers[j];
+    var objVal;
+    var headerBits = header.split('.');
+    var evalable = "record";
+
+    for (var h=0; h<headerBits.length; h++) {
+      evalable+= '["' + headerBits[h] + '"]';
+      objVal = eval(evalable);
+      if (typeof objVal === "undefined") {
+        break;
+      }
+    }
+
+    // If the header is empty or the object value is empty...
+    if ( (!header.length > 0) || typeof objVal === 'undefined' || objVal == '' ) {
+      values.push('');
+    }
+    else {
+      values.push(objVal);
+    }
+  }
+  sheet.appendRow(values);
+}
+
+/**
+* For every row of data in data, generates an object that contains the data. Names of object fields are defined in keys.
+*
+* @param {array} JavaScript 2d array
+* @param {array} array of strings that define the property names for the objects to create
+* @return {array} array of objects
+*/
+function getObjects(data, keys, nestedProps) {
+  var objects = [];
+  // each row
+  for (var i = 0; i < data.length; ++i) {
+    var obj = {};
+    var hasData = false;
+    // each column
+    for (var j = 0; j < data[i].length; ++j) {
+      var cellData = data[i][j];
+      if (isCellEmpty(cellData)) {
+        cellData = null;
+      } else {
+        hasData = true;
+      }
+      if (nestedProps) {
+        var keyBits = keys[j].split('.');
+
+        var finalProp = keyBits.pop();
+        var evalable = "obj";
+        for (var h=0; h<keyBits.length; h++) {
+          evalable+= "['" + keyBits[h] + "']";
+          var checkDef = eval(evalable);
+          if (typeof checkDef === "undefined") {
+            eval(evalable + " = {}");
+          }
+        }
+        if (typeof cellData === "string") {
+          cellData = cellData.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g, "\\n");
+          evalable+= "['" + finalProp + "'] = '" + cellData + "'";
+        } else if (typeof cellData === "object") {
+          evalable+= "['" + finalProp + "'] = " + JSON.stringify(cellData);
+        } else {
+          evalable+= "['" + finalProp + "'] = " + cellData;
+        }
+        eval(evalable);
+      } else {
+        obj[keys[j]] = cellData;
+      }
+    }
+
+    if (hasData) {
+      objects.push(obj);
+    }
+  }
+  return objects;
+}
+
+/**
+* @param {array} array of strings to normalize
+* @return {array} array of normalized strings
+*/
+function normalizeHeaders(headers) {
+  var keys = [];
+  for (var i = 0; i < headers.length; ++i) {
+    var key = normalizeHeader(headers[i]);
+    if (key.length > 0) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/**
+* Normalizes a string, by removing all alphanumeric characters and using mixed case
+* to separate words. The output will always start with a lower case letter.
+* This function is designed to produce JavaScript object property names.
+* Examples:
+*   "First Name" -> "firstName"
+*   "Market Cap (millions) -> "marketCapMillions
+*   "1 number at the beginning is ignored" -> "numberAtTheBeginningIsIgnored"
+* @param {string} string to normalize
+* @return {string} normalized string
+*/
+function normalizeHeader(header) {
+  var key = "";
+  var upperCase = false;
+  for (var i = 0; i < header.length; ++i) {
+    var letter = header[i];
+    if (letter == " " && key.length > 0) {
+      upperCase = true;
+      continue;
+    }
+    if (!isAlnum(letter) && !isDot(letter) && !isUnderscore(letter)) {
+      continue;
+    }
+    if (key.length == 0 && isDigit(letter)) {
+      continue; // first character must be a letter
+    }
+    if (upperCase) {
+      upperCase = false;
+      key += letter.toUpperCase();
+    } else {
+      key += letter.toLowerCase();
+    }
+  }
+  return key;
+}
+
+/**
+*
+* @param {string}
+* @return {boolean} true if the cell where cellData was read from is empty.
+*/
+function isCellEmpty(cellData) {
+  return typeof(cellData) == "string" && cellData == "";
+}
+
+/**
+* @param {string}
+* @return {boolean} true if the character char is alphabetical, false otherwise.
+*/
+function isAlnum(char) {
+  return char >= 'A' && char <= 'Z' ||
+    char >= 'a' && char <= 'z' ||
+    isDigit(char);
+}
+
+/**
+* @param {string}
+* @return {boolean} true if the character is a .
+*/
+function isDot(char) {
+  return char === ".";
+}
+
+/**
+* @param {string}
+* @return {boolean} true if the character is a .
+*/
+function isUnderscore(char) {
+  return char === "_";
+}
+
+
+/**
+* @param {array}
+* @param {string} the key to sort on
+* @return {array} the sorted array
+*/
+function alphabetize(arr, key) {
+  return arr.sort(function compare(a, b) {
+    if (a[key].toLowerCase() > b[key].toLowerCase()){return 1;}
+    if (a[key].toLowerCase() < b[key].toLowerCase()){return -1;}
+    return 0;
+  });
+}
+
+/**
+* @param {string}
+* @return {boolean} Returns true if the character char is a digit, false otherwise.
+*/
+function isDigit(char) {
+  return char >= '0' && char <= '9';
+}
+
+function getId() {
+  var scriptProperties = PropertiesService.getScriptProperties();
+  var ssid = scriptProperties.getProperty('ssid');
+  if (!ssid) {
+    ssid = SpreadsheetApp.getActiveSpreadsheet().getId();
+    scriptProperties.setProperty('ssid', ssid);
+  }
+  return ssid;
+}

@@ -1,0 +1,63 @@
+var api_key = false;
+var api_secret = false;
+
+/**
+* Set the Nexmo key and secret.
+*
+* @param {string} Nexmo API key;
+* @param {string} Nexmo API secret;
+*/
+function setCreds(k,s){
+  api_key = k;
+  api_secret = s;
+}
+
+/**
+* Nexmo Insights
+*
+* @param {object} .number: the number to get insights for, .client_ref: (optional) reference that will get passed back to you in the response
+* @return {string} request_id returned from from Nexmo
+*/
+function getInsight(opt, cb) {
+  if (!opt.number) return "ERROR: it's hard to get insights without a number. :P ";
+  checkCreds_();
+
+  var url = 'https://rest.nexmo.com/ni/json';
+  var payload = {
+    api_key: api_key,
+    api_secret: api_secret,
+    number: opt.number,
+    callback: cb
+  }
+
+  if (opt.client_ref) payload.client_ref = opt.client_ref;
+
+  return getJSON_(url, payload);
+}
+
+function checkCreds_(){
+  if (!api_key) {
+    throw "No Nexmo key";
+  } else if (!api_secret) {
+    throw "No Nexmo secret";
+  } else {
+    return true;
+  }
+}
+
+function getJSON_(url, payload){
+  var response;
+  if (payload) {
+    var options =
+     {
+       method : "post",
+       payload : payload
+     };
+    response = UrlFetchApp.fetch(url, options);
+  } else {
+    response = UrlFetchApp.fetch(url);
+  }
+  var json = response.getContentText();
+  var data = JSON.parse(json);
+  return data;
+}
